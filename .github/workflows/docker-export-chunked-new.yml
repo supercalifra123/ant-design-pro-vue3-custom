@@ -1,0 +1,159 @@
+name: Export Docker Image (Chunked)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker镜像标签'
+        required: true
+        default: 'snowinsahara/dbgpt-new:v0.8.0'
+      chunk_size:
+        description: '分块大小(MB)'
+        required: true
+        default: '1800'
+        type: choice
+        options:
+          - '500'
+          - '1000'
+          - '1800'
+          - '1900'
+
+jobs:
+  export-and-chunk:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pigz
+
+      - name: Pull Docker Image
+        run: |
+          echo "正在拉取镜像: ${{ github.event.inputs.image_tag }}"
+          docker pull ${{ github.event.inputs.image_tag }}
+          docker images ${{ github.event.inputs.image_tag }} --format "{{.Size}}" > image_size.txt
+          echo "镜像大小: $(cat image_size.txt)"
+
+      - name: Save and Compress Image
+        run: |
+          IMAGE_NAME="${{ github.event.inputs.image_tag }}"
+          SAFE_NAME=$(echo "$IMAGE_NAME" | sed 's/[\/:]/_/g')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          echo "正在导出镜像..."
+          docker save "$IMAGE_NAME" | pigz -p $(nproc) > "${SAFE_NAME}.tar.gz"
+          ls -lh "${SAFE_NAME}.tar.gz"
+
+      - name: Split into Chunks
+        run: |
+          FILE="${SAFE_NAME}.tar.gz"
+          CHUNK_SIZE_MB=${{ github.event.inputs.chunk_size }}
+          CHUNK_SIZE=$((CHUNK_SIZE_MB * 1024 * 1024))
+          FILE_SIZE=$(stat -c%s "$FILE")
+          MAX_GITHUB_SIZE=2147483647
+          
+          echo "文件大小: $FILE_SIZE bytes ($(numfmt --to=iec $FILE_SIZE))"
+          echo "分块大小: $CHUNK_SIZE_MB MB"
+          
+          if [ $FILE_SIZE -gt $MAX_GITHUB_SIZE ]; then
+            echo "文件超过2GB，进行分块处理..."
+            split -b $CHUNK_SIZE -d "$FILE" "${FILE}.part-"
+            rm "$FILE"
+            ls -lh "${FILE}.part-"* > chunks.txt
+            cat chunks.txt
+            CHUNK_COUNT=$(ls -1 "${FILE}.part-"* | wc -l)
+            echo "CHUNK_COUNT=$CHUNK_COUNT" >> $GITHUB_ENV
+            echo "已分割为 $CHUNK_COUNT 个分块"
+          else
+            echo "文件未超过2GB，无需分块"
+            echo "CHUNK_COUNT=1" >> $GITHUB_ENV
+            mv "$FILE" "${FILE}.part-00"
+          fi
+
+      - name: Create Merge Script
+        run: |
+          cat > merge.sh << 'MERGE_EOF'
+          #!/bin/bash
+          OUTPUT_FILE="${1:-image.tar.gz}"
+          echo "正在合并分块文件..."
+          if ls *.part-* 1> /dev/null 2>&1; then
+              cat $(ls -v *.part-*) > "$OUTPUT_FILE"
+              echo "合并完成: $OUTPUT_FILE"
+              if command -v pigz &> /dev/null; then
+                  echo "验证文件完整性..."
+                  pigz -t "$OUTPUT_FILE" && echo "文件验证通过" || echo "文件可能损坏"
+              fi
+              echo ""
+              echo "加载Docker镜像:"
+              echo "   docker load -i $OUTPUT_FILE"
+          else
+              echo "未找到分块文件"
+              exit 1
+          fi
+          MERGE_EOF
+          chmod +x merge.sh
+
+      - name: Create README
+        run: |
+          cat > DOWNLOAD_README.md << 'README_EOF'
+          # Docker镜像下载说明
+          
+          ## 合并分块
+          
+          ### Linux/Mac
+          ```bash
+          bash merge.sh
+          # 或手动合并
+          cat $(ls -v *.part-*) > image.tar.gz
+          ```
+          
+          ### Windows PowerShell
+          ```powershell
+          Get-Content *.part-* -Raw | Set-Content image.tar.gz -NoNewline
+          ```
+          
+          ## 加载镜像
+          ```bash
+          docker load -i image.tar.gz
+          docker run -d -p 5000:5000 snowinsahara/dbgpt-new:v0.8.0
+          ```
+          README_EOF
+
+      - name: Upload Chunks to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}-chunks
+          path: |
+            ${{ env.SAFE_NAME }}.tar.gz.part-*
+            merge.sh
+            DOWNLOAD_README.md
+          retention-days: 90
+          compression-level: 0
+
+      - name: Create Release with Chunks
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: docker-export-${{ github.run_number }}
+          name: Docker镜像导出 - ${{ github.event.inputs.image_tag }}
+          body: |
+            ## Docker镜像导出文件
+            
+            **镜像**: `${{ github.event.inputs.image_tag }}`
+            
+            ### 分块信息
+            - 分块数量: **${{ env.CHUNK_COUNT }} 个**
+            - 单块大小: **${{ github.event.inputs.chunk_size }} MB**
+            
+            ### 快速使用
+            1. 下载所有 `part-xx` 文件
+            2. 运行 `bash merge.sh` 合并
+            3. `docker load -i image.tar.gz`
+          files: |
+            ${{ env.SAFE_NAME }}.tar.gz.part-*
+            merge.sh
+            DOWNLOAD_README.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
