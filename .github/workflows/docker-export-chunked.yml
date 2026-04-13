@@ -1,0 +1,235 @@
+name: Export Docker Image (Chunked)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker镜像标签'
+        required: true
+        default: 'snowinsahara/dbgpt-new:v0.8.0'
+      chunk_size:
+        description: '分块大小(MB)'
+        required: true
+        default: '1800'
+        type: choice
+        options:
+          - '500'
+          - '1000'
+          - '1800'
+          - '1900'
+
+jobs:
+  export-and-chunk:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 安装依赖
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pigz  # 更快的并行压缩工具
+
+      # 拉取镜像
+      - name: Pull Docker Image
+        run: |
+          echo "正在拉取镜像: ${{ github.event.inputs.image_tag }}"
+          docker pull ${{ github.event.inputs.image_tag }}
+          
+          # 获取镜像信息
+          docker images ${{ github.event.inputs.image_tag }} --format "{{.Size}}" > image_size.txt
+          echo "镜像大小: $(cat image_size.txt)"
+
+      # 保存并压缩镜像
+      - name: Save and Compress Image
+        run: |
+          IMAGE_NAME="${{ github.event.inputs.image_tag }}"
+          SAFE_NAME=$(echo "$IMAGE_NAME" | sed 's/[\/:]/_/g')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          
+          echo "正在导出镜像..."
+          docker save "$IMAGE_NAME" | pigz -p $(nproc) > "${SAFE_NAME}.tar.gz"
+          
+          ls -lh "${SAFE_NAME}.tar.gz"
+
+      # 智能分块处理
+      - name: Split into Chunks
+        run: |
+          FILE="${SAFE_NAME}.tar.gz"
+          CHUNK_SIZE_MB=${{ github.event.inputs.chunk_size }}
+          CHUNK_SIZE=$((CHUNK_SIZE_MB * 1024 * 1024))  # 转换为字节
+          FILE_SIZE=$(stat -c%s "$FILE")
+          MAX_GITHUB_SIZE=2147483647  # 2GB - 1字节
+          
+          echo "文件大小: $FILE_SIZE bytes ($(numfmt --to=iec $FILE_SIZE))"
+          echo "分块大小: $CHUNK_SIZE_MB MB"
+          
+          # 判断是否需要分块
+          if [ $FILE_SIZE -gt $MAX_GITHUB_SIZE ]; then
+            echo "⚠️ 文件超过2GB，进行分块处理..."
+            
+            # 使用split分块，添加数字后缀
+            split -b $CHUNK_SIZE -d "$FILE" "${FILE}.part-"
+            
+            # 删除原文件，保留分块
+            rm "$FILE"
+            
+            # 生成分块清单
+            ls -lh "${FILE}.part-"* > chunks.txt
+            cat chunks.txt
+            
+            # 计算分块数量
+            CHUNK_COUNT=$(ls -1 "${FILE}.part-"* | wc -l)
+            echo "CHUNK_COUNT=$CHUNK_COUNT" >> $GITHUB_ENV
+            echo "✅ 已分割为 $CHUNK_COUNT 个分块"
+            
+          else
+            echo "✅ 文件未超过2GB，无需分块"
+            echo "CHUNK_COUNT=1" >> $GITHUB_ENV
+            mv "$FILE" "${FILE}.part-00"
+          fi
+
+      # 创建合并脚本
+      - name: Create Merge Script
+        run: |
+          cat > merge.sh << 'EOF'
+#!/bin/bash
+# Docker镜像分块合并脚本
+# 用法: bash merge.sh [输出文件名]
+
+OUTPUT_FILE="${1:-dbgpt-new-v0.8.0.tar.gz}"
+
+echo "🔧 正在合并分块文件..."
+
+# 检查分块文件是否存在
+if ls *.part-* 1> /dev/null 2>&1; then
+    # 按顺序合并
+    cat $(ls -v *.part-*) > "$OUTPUT_FILE"
+    echo "✅ 合并完成: $OUTPUT_FILE"
+    
+    # 验证文件
+    if command -v pigz &> /dev/null; then
+        echo "🔍 验证文件完整性..."
+        pigz -t "$OUTPUT_FILE" && echo "✅ 文件验证通过" || echo "❌ 文件可能损坏"
+    fi
+    
+    echo ""
+    echo "📦 加载Docker镜像:"
+    echo "   docker load -i $OUTPUT_FILE"
+else
+    echo "❌ 未找到分块文件 (*.part-*)"
+    exit 1
+fi
+EOF
+          chmod +x merge.sh
+
+      # 创建使用说明
+      - name: Create README
+        run: |
+          cat > DOWNLOAD_README.md << EOF
+# Docker镜像下载说明
+
+## 📥 下载所有分块文件
+
+### 方法1: 浏览器下载
+1. 进入本工作流的 Artifacts 页面
+2. 下载所有 \`.part-xx\` 文件到同一目录
+
+### 方法2: 命令行下载 (需要GitHub CLI)
+\`\`\`bash
+# 安装gh CLI: https://cli.github.com/
+
+# 登录GitHub
+gh auth login
+
+# 下载最新Artifacts
+gh run download --repo $(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]') --name ${SAFE_NAME}-chunks
+\`\`\`
+
+## 🔧 合并分块
+
+### Windows (PowerShell)
+\`\`\`powershell
+# 按顺序合并
+Get-Content *.part-* -Raw | Set-Content ${SAFE_NAME}.tar.gz -NoNewline
+\`\`\`
+
+### Linux/Mac
+\`\`\`bash
+# 使用提供的脚本
+bash merge.sh
+
+# 或手动合并
+cat $(ls -v *.part-*) > ${SAFE_NAME}.tar.gz
+\`\`\`
+
+## 🐳 加载Docker镜像
+
+\`\`\`bash
+# 解压（如果是.gz文件）
+gunzip ${SAFE_NAME}.tar.gz
+
+# 或直接加载
+docker load -i ${SAFE_NAME}.tar.gz
+
+# 运行容器
+docker run -d --name dbgpt -p 5000:5000 ${{ github.event.inputs.image_tag }}
+\`\`\`
+
+## 📊 文件信息
+
+- **原始镜像**: ${{ github.event.inputs.image_tag }}
+- **分块数量**: ${{ env.CHUNK_COUNT }} 个
+- **分块大小**: ${{ github.event.inputs.chunk_size }} MB/块
+- **生成时间**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+EOF
+
+      # 上传分块文件到Artifacts
+      - name: Upload Chunks to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}-chunks
+          path: |
+            ${{ env.SAFE_NAME }}.tar.gz.part-*
+            merge.sh
+            DOWNLOAD_README.md
+          retention-days: 90
+          compression-level: 0  # 已经是压缩文件，不再压缩
+
+      # 创建Release（可选，用于永久保存）
+      - name: Create Release with Chunks
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: docker-export-${{ github.run_number }}
+          name: Docker镜像导出 - ${{ github.event.inputs.image_tag }}
+          body: |
+            ## 🐳 Docker镜像导出文件
+            
+            **镜像**: `${{ github.event.inputs.image_tag }}`
+            
+            ### 📦 分块信息
+            - 分块数量: **${{ env.CHUNK_COUNT }} 个**
+            - 单块大小: **${{ github.event.inputs.chunk_size }} MB**
+            - 总大小: 见各分块文件
+            
+            ### 📥 快速下载
+            1. 下载所有 `part-xx` 文件
+            2. 使用 `merge.sh` 脚本合并（Linux/Mac）
+            3. 或使用命令: `cat $(ls -v *.part-*) > image.tar.gz`
+            
+            ### 🚀 使用方式
+            ```bash
+            # 合并后加载
+            docker load -i image.tar.gz
+            docker run -d -p 5000:5000 ${{ github.event.inputs.image_tag }}
+            ```
+            
+            **注意**: 分块文件需要全部下载后才能合并使用
+          files: |
+            ${{ env.SAFE_NAME }}.tar.gz.part-*
+            merge.sh
+            DOWNLOAD_README.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
